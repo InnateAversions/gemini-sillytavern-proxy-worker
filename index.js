@@ -160,7 +160,7 @@ export default {
               }
             }
 
-            // C. Normalize reasoning_effort values for Argon 4 / Gemini 3+
+            // C. Normalize reasoning_effort for Gemini 4 (Argon/Carbon/Hydrogen) & Gemini 3+
             const hasExplicitThinkingLevel =
               payload.extra_body?.google?.thinking_config?.thinking_level !==
                 undefined ||
@@ -176,30 +176,47 @@ export default {
                 .trim();
               const modelId = (payload.model || "").toLowerCase();
 
-              // Argon maps "minimal" to "low"; Pro and 3.8 reject "minimal" with HTTP 400
-              const minSupportedTier =
+              // Gemini 4 (Argon, Carbon, Hydrogen), 3.8 Flash, Pro models, and 2.5 reject "minimal" with HTTP 400
+              const rejectsMinimal =
+                modelId.includes("gemini-4") ||
                 modelId.includes("argon") ||
+                modelId.includes("carbon") ||
+                modelId.includes("hydrogen") ||
                 modelId.includes("pro") ||
-                modelId.includes("3.8")
-                  ? "low"
-                  : "minimal";
+                modelId.includes("3.8") ||
+                modelId.includes("2.5");
+
+              const minSupportedTier = rejectsMinimal ? "low" : "minimal";
+
+              // Only Gemini 4 Hydrogen supports "xhigh" natively; others cap at "high"
+              const maxSupportedTier = modelId.includes("hydrogen")
+                ? "xhigh"
+                : "high";
 
               if (!effort || effort === "auto") {
                 delete payload.reasoning_effort;
               } else if (effort === "min" || effort === "minimal") {
                 payload.reasoning_effort = minSupportedTier;
               } else if (
+                effort === "low" ||
+                effort === "medium" ||
+                effort === "high"
+              ) {
+                payload.reasoning_effort = effort;
+              } else if (
                 effort === "max" ||
                 effort === "xhigh" ||
                 effort === "maximum"
               ) {
-                payload.reasoning_effort = "high";
+                payload.reasoning_effort = maxSupportedTier;
               } else if (effort === "none") {
                 const supportsNone =
                   modelId.includes("gemini-2.5") && !modelId.includes("pro");
                 if (!supportsNone) {
                   payload.reasoning_effort = minSupportedTier;
                 }
+              } else {
+                delete payload.reasoning_effort;
               }
             }
 
@@ -320,7 +337,7 @@ export default {
               }
 
               // I. Force tail-end user-role compliance note as the very last message
-              //    (Checks the last non-system message so trailing system prompts don't cause duplicates)
+              // (Checks the last non-system message so trailing system prompts don't cause duplicates)
               if (APPEND_COMPLIANCE_NOTE) {
                 const lastNonSystem = [...payload.messages]
                   .reverse()
@@ -403,7 +420,7 @@ export default {
       }
 
       // 7. Sanitize & return completion responses so Chub/SillyTavern never crash
-      //    with "Cannot read properties of undefined (reading 'content')"
+      // with "Cannot read properties of undefined (reading 'content')"
       const responseHeaders = new Headers(response.headers);
       for (const [key, value] of Object.entries(corsHeaders)) {
         responseHeaders.set(key, value);
