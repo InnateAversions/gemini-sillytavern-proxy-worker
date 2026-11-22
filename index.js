@@ -82,20 +82,14 @@ export default {
       headers.set("Content-Type", "application/json");
 
       const authHeader = request.headers.get("Authorization");
-      if (
-        authHeader &&
-        authHeader.trim() !== "Bearer" &&
-        authHeader.trim() !== ""
-      ) {
+      if (authHeader && authHeader.replace(/^Bearer\s*/i, "").trim() !== "") {
         headers.set("Authorization", authHeader);
-      } else if (env && env.GEMINI_API_KEY) {
-        headers.set("Authorization", `Bearer ${env.GEMINI_API_KEY}`);
       } else {
         return new Response(
           JSON.stringify({
             error: {
               message:
-                "Missing API Key. Provide your Google AI Studio key in Chub/SillyTavern or set GEMINI_API_KEY in Cloudflare Worker secrets.",
+                "Missing API Key. Provide your Google AI Studio key in Chub/SillyTavern.",
               type: "authentication_error",
               code: 401,
             },
@@ -110,7 +104,7 @@ export default {
         );
       }
 
-      // 3. Sanitize POST body so Google's strict OpenAI wrapper doesn't 400
+      // 3. Sanitize chat completion POST payloads so Google's strict OpenAI wrapper doesn't 400
       let isStreamingRequest = false;
       let bodyToSend = undefined;
 
@@ -126,250 +120,327 @@ export default {
               payload.model = payload.model.replace(/^models\//, "");
             }
 
-            // B. Unwrap accidental double-nested `extra_body` and fold top-level Google configs
-            if (
-              payload.extra_body?.extra_body &&
-              typeof payload.extra_body.extra_body === "object"
-            ) {
-              payload.extra_body = {
-                ...payload.extra_body,
-                ...payload.extra_body.extra_body,
-              };
-              delete payload.extra_body.extra_body;
-            }
+            const isChatCompletion =
+              subPath.endsWith("/chat/completions") ||
+              Array.isArray(payload.messages);
 
-            if (payload.google && typeof payload.google === "object") {
-              payload.extra_body = payload.extra_body || {};
-              payload.extra_body.google = {
-                ...(payload.extra_body.google || {}),
-                ...payload.google,
-              };
-              delete payload.google;
-            }
-
-            for (const gKey of [
-              "thinking_config",
-              "safety_settings",
-              "cached_content",
-            ]) {
-              if (payload[gKey] !== undefined) {
-                payload.extra_body = payload.extra_body || {};
-                payload.extra_body.google = payload.extra_body.google || {};
-                payload.extra_body.google[gKey] = payload[gKey];
-                delete payload[gKey];
-              }
-            }
-
-            // C. Normalize reasoning_effort for Gemini 4 (Argon/Carbon/Hydrogen/Neon) & Gemini 3+
-            const hasExplicitThinkingLevel =
-              payload.extra_body?.google?.thinking_config?.thinking_level !==
-                undefined ||
-              payload.extra_body?.google?.thinking_config?.thinking_budget !==
-                undefined;
-
-            if (hasExplicitThinkingLevel) {
-              // Avoid 400 conflict if thinking_config is already set in extra_body
-              delete payload.reasoning_effort;
-            } else {
+            if (isChatCompletion) {
               const modelId = (payload.model || "").toLowerCase();
 
-              // Gemini 4 (Argon, Carbon, Hydrogen, Neon), 3.8 Flash, Pro models, and 2.5 reject "minimal" with HTTP 400
-              const rejectsMinimal =
+              const isGemini4 =
                 modelId.includes("gemini-4") ||
                 modelId.includes("argon") ||
                 modelId.includes("carbon") ||
                 modelId.includes("hydrogen") ||
-                modelId.includes("neon") ||
-                modelId.includes("pro") ||
-                modelId.includes("3.8") ||
-                modelId.includes("2.5");
+                modelId.includes("neon");
 
-              const minSupportedTier = rejectsMinimal ? "low" : "minimal";
+              const isThinkingModel =
+                isGemini4 ||
+                modelId.includes("gemini-3") ||
+                modelId.includes("gemini-2.5") ||
+                modelId.includes("thinking");
 
-              // Only Gemini 4 Hydrogen and Neon support "xhigh" natively; others cap at "high"
-              const supportsXHigh =
-                modelId.includes("hydrogen") || modelId.includes("neon");
-              const maxSupportedTier = supportsXHigh ? "xhigh" : "high";
+              // B. Unwrap accidental double-nested `extra_body` and fold top-level Google configs
+              if (
+                payload.extra_body?.extra_body &&
+                typeof payload.extra_body.extra_body === "object"
+              ) {
+                payload.extra_body = {
+                  ...payload.extra_body,
+                  ...payload.extra_body.extra_body,
+                };
+                delete payload.extra_body.extra_body;
+              }
 
-              // Default to "max" automatically when omitted (e.g., on Chub)
-              const effort =
-                payload.reasoning_effort !== undefined
-                  ? String(payload.reasoning_effort).toLowerCase().trim()
-                  : "max";
+              if (payload.google && typeof payload.google === "object") {
+                payload.extra_body = payload.extra_body || {};
+                payload.extra_body.google = {
+                  ...(payload.extra_body.google || {}),
+                  ...payload.google,
+                };
+                delete payload.google;
+              }
 
-              if (!effort || effort === "auto") {
+              for (const gKey of ["thinking_config", "cached_content"]) {
+                if (payload[gKey] !== undefined) {
+                  payload.extra_body = payload.extra_body || {};
+                  payload.extra_body.google = payload.extra_body.google || {};
+                  payload.extra_body.google[gKey] = payload[gKey];
+                  delete payload[gKey];
+                }
+              }
+
+              // Google's /v1beta/openai/chat/completions rejects extra_body.google.safety_settings (Images-only)
+              if (payload.extra_body?.google?.safety_settings !== undefined) {
+                delete payload.extra_body.google.safety_settings;
+              }
+
+              // Gemini 4 rejects legacy `thinking_budget` with HTTP 400 (uses thinking_level / reasoning_effort)
+              if (
+                isGemini4 &&
+                payload.extra_body?.google?.thinking_config?.thinking_budget !==
+                  undefined
+              ) {
+                delete payload.extra_body.google.thinking_config.thinking_budget;
+                if (
+                  Object.keys(payload.extra_body.google.thinking_config)
+                    .length === 0
+                ) {
+                  delete payload.extra_body.google.thinking_config;
+                }
+              }
+
+              if (
+                payload.extra_body?.google &&
+                Object.keys(payload.extra_body.google).length === 0
+              ) {
+                delete payload.extra_body.google;
+              }
+              if (
+                payload.extra_body &&
+                Object.keys(payload.extra_body).length === 0
+              ) {
+                delete payload.extra_body;
+              }
+
+              // C. Normalize reasoning_effort for Gemini 4 (Argon/Carbon/Hydrogen/Neon) & Gemini 2.5/3+
+              const hasExplicitThinkingConfig =
+                payload.extra_body?.google?.thinking_config?.thinking_level !==
+                  undefined ||
+                payload.extra_body?.google?.thinking_config?.thinking_budget !==
+                  undefined;
+
+              if (hasExplicitThinkingConfig || !isThinkingModel) {
+                // Avoid 400 conflicts when thinking_config is set or on non-thinking legacy models
                 delete payload.reasoning_effort;
-              } else if (effort === "min" || effort === "minimal") {
-                payload.reasoning_effort = minSupportedTier;
-              } else if (
-                effort === "low" ||
-                effort === "medium" ||
-                effort === "high"
-              ) {
-                payload.reasoning_effort = effort;
-              } else if (
-                effort === "max" ||
-                effort === "xhigh" ||
-                effort === "maximum"
-              ) {
-                payload.reasoning_effort = maxSupportedTier;
-              } else if (effort === "none") {
-                const supportsNone =
-                  modelId.includes("gemini-2.5") && !modelId.includes("pro");
-                if (!supportsNone) {
+              } else {
+                // Gemini 4, 3.8 Flash, Pro models, and 2.5 reject "minimal" with HTTP 400
+                const rejectsMinimal =
+                  isGemini4 ||
+                  modelId.includes("pro") ||
+                  modelId.includes("3.8") ||
+                  modelId.includes("2.5");
+
+                const minSupportedTier = rejectsMinimal ? "low" : "minimal";
+
+                // Only Gemini 4 Hydrogen and Neon support "xhigh" natively; others cap at "high"
+                const supportsXHigh =
+                  modelId.includes("hydrogen") || modelId.includes("neon");
+                const maxSupportedTier = supportsXHigh ? "xhigh" : "high";
+
+                // Default to "max" automatically when omitted (e.g., on Chub)
+                const effort =
+                  payload.reasoning_effort !== undefined
+                    ? String(payload.reasoning_effort).toLowerCase().trim()
+                    : "max";
+
+                if (!effort || effort === "auto") {
+                  delete payload.reasoning_effort;
+                } else if (effort === "min" || effort === "minimal") {
                   payload.reasoning_effort = minSupportedTier;
+                } else if (
+                  effort === "low" ||
+                  effort === "medium" ||
+                  effort === "high"
+                ) {
+                  payload.reasoning_effort = effort;
+                } else if (
+                  effort === "max" ||
+                  effort === "xhigh" ||
+                  effort === "maximum"
+                ) {
+                  payload.reasoning_effort = maxSupportedTier;
+                } else if (effort === "none") {
+                  const supportsNone =
+                    modelId.includes("gemini-2.5") && !modelId.includes("pro");
+                  if (!supportsNone) {
+                    payload.reasoning_effort = minSupportedTier;
+                  }
+                } else {
+                  delete payload.reasoning_effort;
+                }
+              }
+
+              // D. Remove all unsupported parameters via strict allowlist
+              for (const key of Object.keys(payload)) {
+                if (!ALLOWED_GOOGLE_PARAMS.has(key)) {
+                  delete payload[key];
+                }
+              }
+
+              // E. Omit temperature/top_p when <= 0 so Gemini uses native sampling, and clamp upper bounds
+              if (
+                payload.temperature !== undefined &&
+                payload.temperature <= 0
+              ) {
+                delete payload.temperature;
+              } else if (typeof payload.temperature === "number") {
+                payload.temperature = Math.min(2, payload.temperature);
+              }
+
+              if (payload.top_p !== undefined && payload.top_p <= 0) {
+                delete payload.top_p;
+              } else if (typeof payload.top_p === "number") {
+                payload.top_p = Math.min(1, payload.top_p);
+              }
+
+              // F. Enforce n === 1 and drop low frontend max_tokens caps on heavy thinking models
+              // so Google uses its native 64K ceiling and thinking doesn't starve the reply
+              if (payload.n && payload.n > 1) {
+                payload.n = 1;
+              }
+
+              const isHeavyThinkingModel =
+                isThinkingModel &&
+                (isGemini4 ||
+                  modelId.includes("3.8") ||
+                  modelId.includes("pro") ||
+                  modelId.includes("2.5"));
+
+              if (isHeavyThinkingModel) {
+                if (
+                  payload.max_tokens !== undefined &&
+                  payload.max_tokens < 32768
+                ) {
+                  delete payload.max_tokens;
+                }
+                if (
+                  payload.max_completion_tokens !== undefined &&
+                  payload.max_completion_tokens < 32768
+                ) {
+                  delete payload.max_completion_tokens;
                 }
               } else {
-                delete payload.reasoning_effort;
-              }
-            }
-
-            // D. Remove all unsupported parameters via strict allowlist
-            for (const key of Object.keys(payload)) {
-              if (!ALLOWED_GOOGLE_PARAMS.has(key)) {
-                delete payload[key];
-              }
-            }
-
-            // E. Omit temperature and top_p when set to 0 so Argon 4 uses native sampling
-            if (payload.temperature !== undefined && payload.temperature <= 0) {
-              delete payload.temperature;
-            } else if (typeof payload.temperature === "number") {
-              payload.temperature = Math.min(2, payload.temperature);
-            }
-
-            if (payload.top_p !== undefined && payload.top_p <= 0) {
-              delete payload.top_p;
-            }
-
-            // F. Google requires n === 1 (or omitted) and max_tokens > 0
-            if (payload.n && payload.n > 1) {
-              payload.n = 1;
-            }
-            if (payload.max_tokens !== undefined && payload.max_tokens <= 0) {
-              delete payload.max_tokens;
-            }
-            if (
-              payload.max_completion_tokens !== undefined &&
-              payload.max_completion_tokens <= 0
-            ) {
-              delete payload.max_completion_tokens;
-            }
-            if (
-              payload.max_tokens !== undefined &&
-              payload.max_completion_tokens !== undefined
-            ) {
-              delete payload.max_tokens;
-            }
-            if (Array.isArray(payload.stop) && payload.stop.length === 0) {
-              delete payload.stop;
-            }
-
-            // G. Clean messages array
-            if (
-              Array.isArray(payload.messages) &&
-              payload.messages.length > 0
-            ) {
-              payload.messages = payload.messages.map((msg) => {
-                const cleanMsg = { ...msg };
-
-                if (cleanMsg.role === "developer") {
-                  cleanMsg.role = "system";
-                }
-
-                // Preserve speaker names & ST example dialogue labels before deleting `name`
                 if (
-                  typeof cleanMsg.name === "string" &&
-                  cleanMsg.name.trim() !== ""
+                  payload.max_tokens !== undefined &&
+                  payload.max_tokens <= 0
                 ) {
-                  const speaker = cleanMsg.name.trim();
-                  const prefix =
-                    speaker === "example_user"
-                      ? "[Example User]: "
-                      : speaker === "example_assistant"
-                      ? "[Example Assistant]: "
-                      : `${speaker}: `;
+                  delete payload.max_tokens;
+                }
+                if (
+                  payload.max_completion_tokens !== undefined &&
+                  payload.max_completion_tokens <= 0
+                ) {
+                  delete payload.max_completion_tokens;
+                }
+              }
 
-                  if (typeof cleanMsg.content === "string") {
-                    if (!cleanMsg.content.startsWith(prefix.trim())) {
-                      cleanMsg.content = `${prefix}${cleanMsg.content}`;
-                    }
-                  } else if (Array.isArray(cleanMsg.content)) {
-                    const firstTextPart = cleanMsg.content.find(
-                      (p) =>
-                        p && p.type === "text" && typeof p.text === "string"
-                    );
-                    if (
-                      firstTextPart &&
-                      !firstTextPart.text.startsWith(prefix.trim())
-                    ) {
-                      firstTextPart.text = `${prefix}${firstTextPart.text}`;
+              if (
+                payload.max_tokens !== undefined &&
+                payload.max_completion_tokens !== undefined
+              ) {
+                delete payload.max_tokens;
+              }
+              if (Array.isArray(payload.stop) && payload.stop.length === 0) {
+                delete payload.stop;
+              }
+
+              // G. Clean messages array
+              if (
+                Array.isArray(payload.messages) &&
+                payload.messages.length > 0
+              ) {
+                payload.messages = payload.messages.map((msg) => {
+                  const cleanMsg = { ...msg };
+
+                  if (cleanMsg.role === "developer") {
+                    cleanMsg.role = "system";
+                  }
+
+                  // Preserve speaker names & ST example dialogue labels before deleting `name`
+                  if (
+                    typeof cleanMsg.name === "string" &&
+                    cleanMsg.name.trim() !== ""
+                  ) {
+                    const speaker = cleanMsg.name.trim();
+                    const prefix =
+                      speaker === "example_user"
+                        ? "[Example User]: "
+                        : speaker === "example_assistant"
+                        ? "[Example Assistant]: "
+                        : `${speaker}: `;
+
+                    if (typeof cleanMsg.content === "string") {
+                      if (!cleanMsg.content.startsWith(prefix.trim())) {
+                        cleanMsg.content = `${prefix}${cleanMsg.content}`;
+                      }
+                    } else if (Array.isArray(cleanMsg.content)) {
+                      const firstTextPart = cleanMsg.content.find(
+                        (p) =>
+                          p && p.type === "text" && typeof p.text === "string"
+                      );
+                      if (
+                        firstTextPart &&
+                        !firstTextPart.text.startsWith(prefix.trim())
+                      ) {
+                        firstTextPart.text = `${prefix}${firstTextPart.text}`;
+                      }
                     }
                   }
-                }
 
-                // Strip any non-standard message properties (name, reasoning, swipes, extra, etc.)
-                for (const key of Object.keys(cleanMsg)) {
-                  if (!ALLOWED_MESSAGE_KEYS.has(key)) {
-                    delete cleanMsg[key];
+                  // Strip non-standard message properties (name, reasoning, swipes, extra, etc.)
+                  for (const key of Object.keys(cleanMsg)) {
+                    if (!ALLOWED_MESSAGE_KEYS.has(key)) {
+                      delete cleanMsg[key];
+                    }
                   }
+
+                  // Prevent empty content 400 error
+                  const isEmptyArray =
+                    Array.isArray(cleanMsg.content) &&
+                    cleanMsg.content.length === 0;
+                  if (
+                    (cleanMsg.content === "" ||
+                      cleanMsg.content === null ||
+                      cleanMsg.content === undefined ||
+                      isEmptyArray) &&
+                    !cleanMsg.tool_calls
+                  ) {
+                    cleanMsg.content = " ";
+                  }
+
+                  return cleanMsg;
+                });
+
+                // H. Ensure at least one non-system message exists so contents[] is never empty
+                const hasNonSystem = payload.messages.some(
+                  (m) => m.role !== "system"
+                );
+                if (!hasNonSystem) {
+                  payload.messages[payload.messages.length - 1].role = "user";
                 }
 
-                // Prevent empty content 400 error
-                const isEmptyArray =
-                  Array.isArray(cleanMsg.content) &&
-                  cleanMsg.content.length === 0;
-                if (
-                  (cleanMsg.content === "" ||
-                    cleanMsg.content === null ||
-                    cleanMsg.content === undefined ||
-                    isEmptyArray) &&
-                  !cleanMsg.tool_calls
-                ) {
-                  cleanMsg.content = " ";
-                }
+                // I. Force tail-end user-role compliance note as the very last message
+                // (Checks the last non-system message so trailing system prompts don't cause duplicates)
+                if (APPEND_COMPLIANCE_NOTE) {
+                  const lastNonSystem = [...payload.messages]
+                    .reverse()
+                    .find((m) => m.role !== "system");
+                  const alreadyAtTail =
+                    lastNonSystem &&
+                    lastNonSystem.role === "user" &&
+                    typeof lastNonSystem.content === "string" &&
+                    lastNonSystem.content.includes(COMPLIANCE_TEXT);
 
-                return cleanMsg;
-              });
-
-              // H. Ensure at least one non-system message exists so contents[] is never empty
-              const hasNonSystem = payload.messages.some(
-                (m) => m.role !== "system"
-              );
-              if (!hasNonSystem) {
-                payload.messages[payload.messages.length - 1].role = "user";
-              }
-
-              // I. Force tail-end user-role compliance note as the very last message
-              // (Checks the last non-system message so trailing system prompts don't cause duplicates)
-              if (APPEND_COMPLIANCE_NOTE) {
-                const lastNonSystem = [...payload.messages]
-                  .reverse()
-                  .find((m) => m.role !== "system");
-                const alreadyAtTail =
-                  lastNonSystem &&
-                  lastNonSystem.role === "user" &&
-                  typeof lastNonSystem.content === "string" &&
-                  lastNonSystem.content.includes(COMPLIANCE_TEXT);
-
-                if (!alreadyAtTail) {
-                  payload.messages.push({
-                    role: "user",
-                    content: COMPLIANCE_TEXT,
-                  });
+                  if (!alreadyAtTail) {
+                    payload.messages.push({
+                      role: "user",
+                      content: COMPLIANCE_TEXT,
+                    });
+                  }
                 }
               }
             }
 
             bodyToSend = JSON.stringify(payload);
           } catch {
-            // If not valid JSON, pass raw text
+            // If not valid JSON, pass raw text through
             bodyToSend = rawText;
           }
         }
       }
 
-      // 4. Fetch from Google
+      // 4. Forward request to Google AI Studio OpenAI-compatible endpoint
       const response = await fetch(targetUrl, {
         method: request.method,
         headers: headers,
@@ -405,7 +476,7 @@ export default {
         });
       }
 
-      // 6. Strip "models/" prefix from GET /models list so dropdowns are clean
+      // 6. Strip "models/" prefix from GET /models list so frontend dropdowns are clean
       if (request.method === "GET" && subPath.endsWith("/models")) {
         const modelsData = await response.json();
         if (modelsData && Array.isArray(modelsData.data)) {
@@ -432,7 +503,7 @@ export default {
 
       const contentType = responseHeaders.get("content-type") || "";
 
-      // 7.A: Non-streaming JSON response sanitizer
+      // 7.A: Non-streaming JSON response sanitizer (full stop-reason parity with 7.B)
       if (
         request.method === "POST" &&
         !isStreamingRequest &&
@@ -469,17 +540,39 @@ export default {
                 safeChoice.message.content === null ||
                 safeChoice.message.content === undefined
               ) {
-                // If finish_reason is "length" with empty content, Argon spent all max_tokens thinking
-                const fallbackNotice =
-                  safeChoice.finish_reason === "length"
-                    ? "[Response cut off: Argon spent all Max New Tokens thinking. Raise Max New Tokens to 4096+ in your settings.]"
-                    : safeChoice.finish_reason === "content_filter"
-                    ? "[Response blocked by Google content filter.]"
-                    : " ";
-                safeChoice.message.content = safeChoice.message.tool_calls
-                  ? ""
-                  : fallbackNotice;
+                safeChoice.message.content = "";
               }
+
+              const hasContent =
+                typeof safeChoice.message.content === "string" &&
+                safeChoice.message.content.trim().length > 0;
+              const fr =
+                typeof safeChoice.finish_reason === "string"
+                  ? safeChoice.finish_reason.toLowerCase()
+                  : null;
+
+              if (
+                fr === "content_filter" ||
+                fr === "safety" ||
+                fr === "prohibited_content"
+              ) {
+                safeChoice.message.content += hasContent
+                  ? "\n\n[Generation stopped by Google content filter]"
+                  : "[Response blocked by Google content filter.]";
+              } else if (fr === "length" || fr === "max_tokens") {
+                safeChoice.message.content += hasContent
+                  ? "\n\n[Response cut off: Max New Tokens reached.]"
+                  : "[Response cut off: Model spent all Max New Tokens thinking. Raise Max New Tokens in settings.]";
+              } else if (fr === "continuation") {
+                safeChoice.message.content +=
+                  "\n\n[Response cut off: Hit Google single-segment output limit (CONTINUATION).]";
+              } else if (fr === "recitation") {
+                safeChoice.message.content +=
+                  "\n\n[Generation stopped by Google recitation filter]";
+              } else if (!hasContent && !safeChoice.message.tool_calls) {
+                safeChoice.message.content = " ";
+              }
+
               return safeChoice;
             });
           }
@@ -492,6 +585,8 @@ export default {
             },
           });
         } catch {
+          responseHeaders.delete("content-length");
+          responseHeaders.delete("content-encoding");
           return new Response(rawRespText, {
             status: response.status,
             headers: responseHeaders,
@@ -499,74 +594,227 @@ export default {
         }
       }
 
-      // 7.B: Streaming SSE response sanitizer (guards against malformed/empty delta chunks)
+      // 7.B: Streaming SSE response sanitizer (keepalive + clean framing + real stop diagnostics)
       if (contentType.includes("text/event-stream") && response.body) {
+        responseHeaders.delete("content-length");
+        responseHeaders.delete("content-encoding");
         responseHeaders.set("Cache-Control", "no-cache, no-transform");
         responseHeaders.set("X-Accel-Buffering", "no");
+        responseHeaders.set("Content-Type", "text/event-stream; charset=utf-8");
 
+        const reader = response.body.getReader();
         const decoder = new TextDecoder();
         const encoder = new TextEncoder();
-        let buffer = "";
 
-        function processLine(line, controller) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith("data:") && trimmed !== "data: [DONE]") {
-            const jsonStr = trimmed.slice(5).trim();
+        let buffer = "";
+        let hasStreamedContent = false;
+        let sawDone = false;
+        let keepaliveTimer = null;
+
+        function emitChunk(controller, parsed) {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify(parsed)}\n\n`)
+          );
+        }
+
+        function processLine(rawLine, controller) {
+          const line = rawLine.replace(/\r$/, "").trim();
+          // Skip blank lines and upstream SSE comments; each event is cleanly framed with \n\n
+          if (!line || line.startsWith(":")) {
+            return;
+          }
+
+          if (line.startsWith("data:")) {
+            const jsonStr = line.slice(5).trim();
+            if (!jsonStr) return;
+            if (jsonStr === "[DONE]") {
+              sawDone = true;
+              return;
+            }
+
             try {
               const parsed = JSON.parse(jsonStr);
+
+              // Handle prompt-level blocks or empty choices
               if (
                 !Array.isArray(parsed.choices) ||
                 parsed.choices.length === 0
               ) {
-                parsed.choices = [
-                  { index: 0, delta: { content: "" }, finish_reason: null },
-                ];
-              } else {
-                const c = parsed.choices[0];
-                if (!c.delta || typeof c.delta !== "object") {
-                  c.delta = {
-                    content:
-                      c.finish_reason === "content_filter"
-                        ? "\n\n[Generation stopped by Google content filter]"
-                        : "",
-                  };
-                } else if (
-                  c.delta.content === undefined ||
-                  c.delta.content === null
-                ) {
-                  c.delta.content = "";
+                const blockReason =
+                  parsed?.promptFeedback?.blockReason ||
+                  parsed?.error?.message;
+
+                if (blockReason) {
+                  parsed.choices = [
+                    {
+                      index: 0,
+                      delta: {
+                        content: `\n\n[Blocked by Google API: ${blockReason}]`,
+                      },
+                      finish_reason: "content_filter",
+                    },
+                  ];
+                  hasStreamedContent = true;
+                  emitChunk(controller, parsed);
+                } else if (parsed.usage) {
+                  parsed.choices = [
+                    { index: 0, delta: { content: "" }, finish_reason: null },
+                  ];
+                  emitChunk(controller, parsed);
                 }
+                return;
               }
-              controller.enqueue(
-                encoder.encode(`data: ${JSON.stringify(parsed)}\n`)
-              );
+
+              const c = parsed.choices[0];
+              if (!c.delta || typeof c.delta !== "object") {
+                c.delta = { content: "" };
+              } else if (
+                c.delta.content === undefined ||
+                c.delta.content === null
+              ) {
+                c.delta.content = "";
+              }
+
+              if (
+                (typeof c.delta.content === "string" &&
+                  c.delta.content.length > 0) ||
+                c.delta.tool_calls
+              ) {
+                hasStreamedContent = true;
+              }
+
+              // Catch real stop/cutoff reasons even when Google sends c.delta = {}
+              const fr =
+                typeof c.finish_reason === "string"
+                  ? c.finish_reason.toLowerCase()
+                  : null;
+
+              if (
+                fr === "content_filter" ||
+                fr === "safety" ||
+                fr === "prohibited_content"
+              ) {
+                c.delta.content +=
+                  "\n\n[Generation stopped by Google content filter]";
+                hasStreamedContent = true;
+              } else if (fr === "length" || fr === "max_tokens") {
+                c.delta.content += hasStreamedContent
+                  ? "\n\n[Response cut off: Max New Tokens reached.]"
+                  : "[Response cut off: Model spent all Max New Tokens thinking. Raise Max New Tokens in settings.]";
+                hasStreamedContent = true;
+              } else if (fr === "continuation") {
+                c.delta.content +=
+                  "\n\n[Response cut off: Hit Google single-segment output limit (CONTINUATION).]";
+                hasStreamedContent = true;
+              } else if (fr === "recitation") {
+                c.delta.content +=
+                  "\n\n[Generation stopped by Google recitation filter]";
+                hasStreamedContent = true;
+              }
+
+              emitChunk(controller, parsed);
               return;
             } catch {
-              // Pass unparseable lines through as-is
+              controller.enqueue(encoder.encode(`${line}\n\n`));
+              return;
             }
           }
-          controller.enqueue(encoder.encode(line + "\n"));
+
+          controller.enqueue(encoder.encode(`${line}\n`));
         }
 
-        const transformStream = new TransformStream({
-          transform(chunk, controller) {
-            buffer += decoder.decode(chunk, { stream: true });
-            const lines = buffer.split("\n");
-            buffer = lines.pop() || "";
+        const stream = new ReadableStream({
+          async start(controller) {
+            // Keep Cloudflare/Chub connection alive during long high/xhigh silent thinking pauses
+            keepaliveTimer = setInterval(() => {
+              try {
+                controller.enqueue(encoder.encode(": keepalive\n\n"));
+              } catch {
+                clearInterval(keepaliveTimer);
+              }
+            }, 15000);
 
-            for (const line of lines) {
-              processLine(line, controller);
+            try {
+              while (!sawDone) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
+
+                for (const line of lines) {
+                  processLine(line, controller);
+                  if (sawDone) break;
+                }
+              }
+
+              if (!sawDone) {
+                buffer += decoder.decode();
+                if (buffer.trim()) {
+                  for (const line of buffer.split("\n")) {
+                    processLine(line, controller);
+                    if (sawDone) break;
+                  }
+                }
+              } else {
+                reader.cancel().catch(() => {});
+              }
+
+              // Catch silent empty closes from Google
+              if (!hasStreamedContent) {
+                emitChunk(controller, {
+                  id: "proxy-empty-guard",
+                  object: "chat.completion.chunk",
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        content:
+                          "[Empty response: Google closed the stream without emitting text (silent filter block or thinking exhaustion).]",
+                      },
+                      finish_reason: "stop",
+                    },
+                  ],
+                });
+              }
+
+              controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+
+              controller.close();
+            } catch (streamErr) {
+              try {
+                emitChunk(controller, {
+                  id: "proxy-stream-error",
+                  object: "chat.completion.chunk",
+                  choices: [
+                    {
+                      index: 0,
+                      delta: {
+                        content: `\n\n[Stream interrupted: ${
+                          streamErr?.message || "Upstream connection dropped"
+                        }]`,
+                      },
+                      finish_reason: "stop",
+                    },
+                  ],
+                });
+                controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                controller.close();
+              } catch {
+                // Client already disconnected
+              }
+            } finally {
+              clearInterval(keepaliveTimer);
             }
           },
-          flush(controller) {
-            buffer += decoder.decode();
-            if (buffer.trim()) {
-              processLine(buffer, controller);
-            }
+          cancel() {
+            clearInterval(keepaliveTimer);
+            reader.cancel().catch(() => {});
           },
         });
 
-        return new Response(response.body.pipeThrough(transformStream), {
+        return new Response(stream, {
           status: response.status,
           statusText: response.statusText,
           headers: responseHeaders,
@@ -583,7 +831,7 @@ export default {
         JSON.stringify({
           error: {
             message: err.message || "Proxy execution error",
-            type: "invalid_request_error",
+            type: "internal_server_error",
             code: 500,
           },
         }),
